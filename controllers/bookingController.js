@@ -29,31 +29,14 @@ const makeBooking = async (req, res) => {
     }
 
     // ==========================================
-    // 🛡️ STEP 1: REDIS ATOMIC LOCKING
+    // 🛡️ STEP 1: VERIFY REDIS ATOMIC SEAT LOCKS
     // ==========================================
-    
-    // Create unique lock keys for these exact seats (e.g. "lock:show_123:seat_A1")
-    const lockKeys = selectedSeats.map(seat => `lock:show_${showId}:seat_${seat}`);
-
-    for (const key of lockKeys) {
-      // SET NX = Set if Not eXists, EX 60 = Expire in 60 seconds
-      // This is an ATOMIC operation. Only 1 user can succeed at the exact same millisecond.
-      const lockAcquired = await redis.set(key, userId, 'NX', 'EX', 60);
-      
-      if (lockAcquired) {
-        acquiredLocks.push(key);
-      } else {
-        // 🚨 RACE CONDITION AVERTED! 
-        // Someone else is booking this seat right now. 
-        // Release the locks we *did* manage to get, then tell the user.
-        if (acquiredLocks.length > 0) {
-          await redis.del(acquiredLocks);
-        }
-        return res.status(409).json({
-          success: false,
-          message: "One or more selected seats are currently being booked by someone else. Please try again."
-        });
-      }
+    const lockCheck = await redis.verifyOrAcquireSeatLocks(showId, selectedSeats, userId, 120);
+    if (!lockCheck.success) {
+      return res.status(409).json({
+        success: false,
+        message: lockCheck.message || "One or more selected seats are currently being booked by someone else."
+      });
     }
 
     // ==========================================
@@ -63,16 +46,14 @@ const makeBooking = async (req, res) => {
     // Fetch the specific Show document
     const show = await Show.findById(showId);
     if (!show) {
-      // 🧹 Cleanup locks before returning!
-      if (acquiredLocks.length > 0) await redis.del(acquiredLocks);
+      await redis.releaseSeatLocks(showId, selectedSeats, userId);
       return res.status(404).json({ success: false, message: "Showtime not found." });
     }
 
     // Check if any selected seats are already booked for this specific date/show
-    const alreadyBooked = selectedSeats.some(seat => show.bookedSeats.includes(seat));
+    const alreadyBooked = selectedSeats.some(seat => show.bookedSeats?.includes(seat));
     if (alreadyBooked) {
-      // 🧹 Cleanup locks before returning!
-      if (acquiredLocks.length > 0) await redis.del(acquiredLocks);
+      await redis.releaseSeatLocks(showId, selectedSeats, userId);
       return res.status(400).json({
         success: false,
         message: "One or more selected seats are already booked. Please choose other seats."
@@ -90,18 +71,16 @@ const makeBooking = async (req, res) => {
 
     await newBooking.save();
 
-    // 🎯 LOCK SEATS: Push seats into the Show document's bookedSeats array
+    // 🎯 PERMANENT SEAT OCCUPATION: Push seats into Show document's bookedSeats array
     await Show.findByIdAndUpdate(showId, {
       $push: { bookedSeats: { $each: selectedSeats } }
     });
 
     // ==========================================
-    // 🧹 STEP 3: CLEANUP & SUCCESS
+    // 🧹 STEP 3: CLEANUP REDIS LOCKS & SUCCESS
     // ==========================================
     // The seats are safely in MongoDB, so we can delete the temporary Redis locks!
-    if (acquiredLocks.length > 0) {
-      await redis.del(acquiredLocks);
-    }
+    await redis.releaseSeatLocks(showId, selectedSeats, userId);
 
     return res.status(201).json({
       success: true,
@@ -110,10 +89,6 @@ const makeBooking = async (req, res) => {
     });
 
   } catch (error) {
-    // 🚨 If the server crashes during this process, RELEASE THE LOCKS!
-    if (acquiredLocks.length > 0) {
-      await redis.del(acquiredLocks);
-    }
     console.error("Booking Error:", error);
     return res.status(500).json({ success: false, message: error.message });
   }

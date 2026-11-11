@@ -1,31 +1,25 @@
-if (process.env.NODE_ENV !== 'production') {
-    require('dotenv').config();
-}
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
+require('dotenv').config({ path: path.resolve(__dirname, 'env') });
+require('dotenv').config();
+
 const PORT = process.env.PORT || 3000;
 const cors = require('cors');
 const express = require("express");
 const app = express();
-const paymentRoutes = require('./routes/paymentRoutes');
 const mongoose = require('mongoose');
-const listing = require('./models/testingModel.js')
-const Movies = require("./models/movieModel.js")
-const Shows = require('./models/showModel.js')
-const Users = require('./models/userModel.js')
-const Theater =require('./models/theaterModel.js')
+
+const paymentRoutes = require('./routes/paymentRoutes');
 const theaterRoute = require('./routes/theaterRoute');
-const bcrypt = require('bcryptjs');
-const { notFound, errorHandler } = require('./middlewares/errorMiddleware');
-//const { addTheater, getAllTheaters } = require('../controllers/theaterController');
-const movieRoutes=require('./routes/moviesRoutes.js')
-const showRoutes=require('./routes/showRoutes.js')
+const movieRoutes = require('./routes/moviesRoutes.js');
+const showRoutes = require('./routes/showRoutes.js');
 const userRoutes = require('./routes/userRoutes');
-const bookingRoutes=require('./routes/bookingRoutes.js')
-const MongoStore = require('connect-mongo'); //  CORRECT//for store session on cloud
-//const PORTpassport = require('passport');
-//const dbUrl='mongodb://127.0.0.1:27017/myshow'
-//const methodOverride = require('method-override');\
-const mongodbUrl=process.env.MONGODB_URI
+const bookingRoutes = require('./routes/bookingRoutes.js');
+const { notFound, errorHandler } = require('./middlewares/errorMiddleware');
 const morgan = require('morgan');
+
+const mongodbUrl = process.env.MONGODB_URI;
+
 app.use(cors({
   origin: [
     'http://localhost:5173',
@@ -37,39 +31,43 @@ app.use(cors({
 app.use(express.json());
 
 app.disable('etag'); // 👈 Disables 304 caching so fresh data is always sent!
+
 async function main() {
-    //for local db connection await mongoose.connect('mongodb://127.0.0.1:27017/airbnb');
-    //   await mongoose.connect(dbUrl)
-    await mongoose.connect(mongodbUrl);
-
-    console.log('MongoDB connected');
+  if (!mongodbUrl) {
+    console.error('❌ MONGODB_URI is missing in environment variables');
+    return;
+  }
+  await mongoose.connect(mongodbUrl);
+  console.log('MongoDB connected');
 }
-main().catch(err => console.log(err));
-app.get('/', (req, res) => {
-    res.redirect("/listing/movies");
-});
-
-
+main().catch(err => console.log('MongoDB Connection Error:', err));
 
 app.use((req, res, next) => {
-    console.log(`Incoming Request: ${req.method} ${req.url}`);
-    next();
+  console.log(`Incoming Request: ${req.method} ${req.url}`);
+  next();
 });
 app.use(morgan('dev'));
 
-// Base path for all authentication requests
-app.use('/listing/users', userRoutes);
-app.use('/listing/payment',paymentRoutes);
-app.use('/listing/movies', movieRoutes);
-app.use('/listing/booking',bookingRoutes)
-app.use('/listing/shows',showRoutes)
-app.use('/listing/theaters', theaterRoute);
-//--------------------------------------------------------------
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.get('/', (req, res) => {
+  res.redirect("/listing/movies");
 });
 
+app.get('/listing', (req, res) => {
+  res.status(200).send({
+    success: true,
+    message: "Welcome to the BookMyShow API",
+    version: "1.0.0",
+    status: "Running"
+  });
+});
+
+// Base path for all authentication requests
+app.use('/listing/users', userRoutes);
+app.use('/listing/payment', paymentRoutes);
+app.use('/listing/movies', movieRoutes);
+app.use('/listing/booking', bookingRoutes);
+app.use('/listing/shows', showRoutes);
+app.use('/listing/theaters', theaterRoute);
 
 // 3. 404 Handler (if no route matched above)
 app.use(notFound);
@@ -77,12 +75,6 @@ app.use(notFound);
 // 4. Global Error Handler (to catch server crashes)
 app.use(errorHandler);
 
-// At the bottom of server.js, after all other routes
-app.get('/listing', (req, res) => {
-    res.status(200).send({
-        success: true,
-        message: "Welcome to the BookMyShow API",
-        version: "1.0.0",
-        status: "Running"
-    });
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

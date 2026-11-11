@@ -1,5 +1,6 @@
 const Show = require("../models/showModel.js");
 const Theater = require("../models/theaterModel.js");
+const redisClient = require("../config/redis.js");
 
 // 1. ADD SHOW (Generates individual show documents for each date)
 const addShow = async (req, res) => {
@@ -190,7 +191,7 @@ const deleteShow = async (req, res) => {
   }
 };
 
-// 5. GET SHOW BY ID (Optimized with .lean())
+// 5. GET SHOW BY ID (Optimized with .lean() & includes temporary Redis locks)
 const getShowById = async (req, res) => {
   try {
     const reqId = req.params.id;
@@ -207,7 +208,23 @@ const getShowById = async (req, res) => {
       return res.status(404).send({ success: false, message: "Show not found" });
     }
 
-    return res.status(200).send({ success: true, data: show });
+    // 🛡️ Fetch any active Redis seat locks for this show
+    const lockedSeats = await redisClient.getLockedSeats(reqId);
+
+    // Merge permanently booked seats from MongoDB + temporary locked seats from Redis
+    const allUnavailableSeats = Array.from(new Set([
+      ...(show.bookedSeats || []),
+      ...(lockedSeats || [])
+    ]));
+
+    return res.status(200).send({
+      success: true,
+      data: {
+        ...show,
+        bookedSeats: allUnavailableSeats,
+        temporaryLockedSeats: lockedSeats || []
+      }
+    });
   } catch (err) {
     console.error("Error in getShowById:", err);
     return res.status(500).send({ success: false, message: err.message });

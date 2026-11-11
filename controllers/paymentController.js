@@ -1,6 +1,6 @@
 const Razorpay = require('razorpay');
-// 🚨 Import your Redis client (Make sure the path matches your folder structure!)
-const redisClient = require('../config/redis'); 
+const redisClient = require('../config/redis');
+const Show = require('../models/showModel');
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -8,73 +8,84 @@ const razorpay = new Razorpay({
 });
 
 const createOrder = async (req, res) => {
+  let acquiredLockSeats = [];
   try {
-    // We now request showId and seats from the frontend to lock them
-    const { amount, showId, seats } = req.body; 
-// Smartly find the user ID regardless of how the auth middleware formats it
-let userId;
-if (req.user && req.user._id) userId = req.user._id.toString();
-else if (req.user && req.user.id) userId = req.user.id.toString();
-else if (req.userId) userId = req.userId.toString();
-else if (req.body.userId) userId = req.body.userId.toString();
+    const { amount, showId, seats } = req.body;
 
-if (!userId) {
-  return res.status(401).json({ 
-    success: false, 
-    message: "Auth Error: Backend could not find your User ID." 
-  });
-}
-    // 1. Array to track seats we successfully locked, in case we need to rollback
-    const lockedSeats = [];
+    // Smartly find user ID regardless of how auth middleware attaches it
+    let userId;
+    if (req.user && req.user._id) userId = req.user._id.toString();
+    else if (req.user && req.user.id) userId = req.user.id.toString();
+    else if (req.userId) userId = req.userId.toString();
+    else if (req.body.userId) userId = req.body.userId.toString();
 
-    // 2. Try to lock EVERY seat requested
-    for (let seat of seats) {
-      const lockKey = `lock:show:${showId}:seat:${seat}`;
-      
-      // NX: Only set if Not eXists | EX: Expire lock in 600 seconds (10 mins)
-      const acquired = await redisClient.set(lockKey, userId, {
-        NX: true,
-        EX: 600
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Auth Error: User ID not found. Please log in again."
       });
-
-      if (!acquired) {
-        // CONCURRENCY ROLLBACK: If we fail to lock this seat, release any seats we ALREADY locked
-        for (let lockedSeat of lockedSeats) {
-          await redisClient.del(`lock:show:${showId}:seat:${lockedSeat}`);
-        }
-        return res.status(400).json({ 
-          success: false, 
-          message: `Seat ${seat} is currently being booked by another user. Please select a different seat.` 
-        });
-      }
-      
-      lockedSeats.push(seat);
     }
+
+    if (!showId || !Array.isArray(seats) || seats.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Show ID and selected seats are required."
+      });
+    }
+
+    // 1. Verify show exists & seats are not already booked in MongoDB
+    const show = await Show.findById(showId);
+    if (!show) {
+      return res.status(404).json({ success: false, message: "Show not found." });
+    }
+
+    const alreadyBooked = seats.some((seat) => show.bookedSeats?.includes(seat));
+    if (alreadyBooked) {
+      return res.status(400).json({
+        success: false,
+        message: "One or more selected seats have already been booked. Please choose different seats."
+      });
+    }
+
+    // 2. 🛡️ ATOMIC REDIS LOCKING (NX EX 600 = 10 mins)
+    const lockResult = await redisClient.acquireSeatLocks(showId, seats, userId, 600);
+    if (!lockResult.success) {
+      return res.status(409).json({
+        success: false,
+        message: lockResult.message
+      });
+    }
+
+    acquiredLockSeats = lockResult.lockedSeats;
 
     // 3. If ALL locks succeeded, create the Razorpay order
     const options = {
-      amount: amount * 100, // ₹1 = 100 paise
+      amount: Math.round(amount * 100), // ₹1 = 100 paise
       currency: "INR",
       receipt: `receipt_${Date.now()}`,
     };
-    
+
     const order = await razorpay.orders.create(options);
-    
+
     return res.status(200).json({ success: true, order });
   } catch (error) {
+    // If Razorpay order creation fails, release the locks immediately
+    if (acquiredLockSeats.length > 0) {
+      await redisClient.releaseSeatLocks(req.body.showId, acquiredLockSeats);
+    }
     console.error("Razorpay Error:", error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// 4. NEW: Function to release locks if the user closes the payment popup
+// 4. Release locks if user closes the payment popup without paying
 const cancelLock = async (req, res) => {
   try {
     const { showId, seats } = req.body;
-    for (let seat of seats) {
-      await redisClient.del(`lock:show:${showId}:seat:${seat}`);
-    }
-    return res.status(200).json({ success: true, message: "Seat locks released." });
+    let userId = req.user?._id || req.user?.id || req.userId || req.body?.userId;
+
+    await redisClient.releaseSeatLocks(showId, seats, userId);
+    return res.status(200).json({ success: true, message: "Seat locks released successfully." });
   } catch (error) {
     console.error("Lock Release Error:", error);
     return res.status(500).json({ success: false, message: error.message });
