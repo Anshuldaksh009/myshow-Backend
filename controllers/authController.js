@@ -4,10 +4,22 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config(); 
 
 const OTP = require('../models/otpModel');
+const nodemailer = require('nodemailer');
 const { Resend } = require('resend'); // 👈 Using Resend API (Render-friendly, bypasses SMTP blocks)
 
 // Initialize Resend with your API key from environment variables
 const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Initialize Nodemailer transporter with Gmail credentials
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+  connectionTimeout: 10000,
+  socketTimeout: 10000,
+});
 
 // ==========================================
 // 1. SEND OTP CONTROLLER
@@ -37,29 +49,70 @@ exports.sendOtp = async (req, res) => {
       otp: hashedOtp,
     });
 
-    // Send email via Resend API (Never times out on Render!)
-    const data = await resend.emails.send({
-      from: 'BookMyShow <onboarding@resend.dev>', // Change to your verified domain later if desired
-      to: [email],
-      subject: '🔑 Your Verification Code for BookMyShow',
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px;">
-          <h2>BookMyShow Email Verification</h2>
-          <p>Your OTP verification code is:</p>
-          <h1 style="color: #dc3545; letter-spacing: 4px;">${generatedOtp}</h1>
-          <p>This code will expire in 5 minutes.</p>
-        </div>
-      `,
-    });
+    console.log(`🔑 [OTP] Verification code for ${email}: ${generatedOtp}`);
 
-    console.log("✅ Email sent successfully via Resend:", data);
+    let emailSent = false;
+    let lastError = null;
+
+    // 1. Try Nodemailer first (delivers to ANY email address using Gmail App Password)
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      try {
+        await transporter.sendMail({
+          from: `"BookMyShow" <${process.env.EMAIL_USER}>`,
+          to: email,
+          subject: '🔑 Your Verification Code for BookMyShow',
+          html: `
+            <div style="font-family: Arial, sans-serif; padding: 20px;">
+              <h2>BookMyShow Email Verification</h2>
+              <p>Your OTP verification code is:</p>
+              <h1 style="color: #dc3545; letter-spacing: 4px;">${generatedOtp}</h1>
+              <p>This code will expire in 5 minutes.</p>
+            </div>
+          `,
+        });
+        emailSent = true;
+        console.log(`✅ Email sent successfully via Nodemailer to ${email}`);
+      } catch (nmErr) {
+        lastError = nmErr;
+        console.warn('⚠️ Nodemailer failed, trying Resend fallback:', nmErr.message);
+      }
+    }
+
+    // 2. If Nodemailer didn't succeed, try Resend API
+    if (!emailSent && process.env.RESEND_API_KEY) {
+      const data = await resend.emails.send({
+        from: 'BookMyShow <onboarding@resend.dev>',
+        to: [email],
+        subject: '🔑 Your Verification Code for BookMyShow',
+        html: `
+          <div style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>BookMyShow Email Verification</h2>
+            <p>Your OTP verification code is:</p>
+            <h1 style="color: #dc3545; letter-spacing: 4px;">${generatedOtp}</h1>
+            <p>This code will expire in 5 minutes.</p>
+          </div>
+        `,
+      });
+
+      if (data.error) {
+        console.error('❌ Resend API Error:', data.error.message);
+        lastError = new Error(data.error.message);
+      } else {
+        emailSent = true;
+        console.log('✅ Email sent successfully via Resend:', data);
+      }
+    }
+
+    if (!emailSent && lastError) {
+      throw lastError;
+    }
 
     return res.status(200).send({
       success: true,
       message: `OTP sent successfully to ${email}`,
     });
   } catch (error) {
-    console.error('❌ RESEND EMAIL ERROR DETAILS:', error);
+    console.error('❌ EMAIL ERROR DETAILS:', error);
 
     return res.status(500).send({
       success: false,
